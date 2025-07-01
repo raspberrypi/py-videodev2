@@ -1,0 +1,5 @@
+__pycache__/
+videodev2.h
+*.py[cod]
+*$py.class
+.gitignore

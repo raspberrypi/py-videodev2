@@ -527,7 +527,7 @@ class VideoDevHeaderParser:
         """Parse inline union/struct within a struct and return information for nested class generation"""
         lines = content[start_pos:].split("\n")
 
-        # Match inline union/struct pattern like "union { ... } field_name;"
+        # Match inline union/struct pattern like "union { ... } field_name;" or anonymous "union { ... };"
         first_line = self.clean_line(lines[0])
         if not ("union {" in first_line or "struct {" in first_line):
             return None, 0
@@ -560,14 +560,22 @@ class VideoDevHeaderParser:
             # Check if we've reached the end with field name
             if brace_count == 0 and i > 0:
                 # Extract field name after closing brace
-                # Pattern: "} field_name;"
+                # Pattern: "} field_name;" or anonymous "} __attribute__ ((packed));"
                 field_name_match = re.search(r"}\s*(\w+)\s*;", clean_line)
                 if field_name_match:
                     field_name = field_name_match.group(1)
+                else:
+                    # Check for anonymous union/struct (no field name, just attributes)
+                    # More flexible pattern to match various attribute formats
+                    if re.search(r"}\s*(__attribute__\s*\(\s*\([^)]*\)\s*\))?\s*;", clean_line):
+                        # Anonymous union/struct - use a default name
+                        field_name = "u" if is_union else "s"
+                    else:
+                        # Unable to determine field name, skip
+                        return None, i + 1
 
-                    # Return inline union information for nested class generation
-                    return CInlineUnion(field_name, union_fields, is_union), i + 1
-                break
+                # Return inline union information for nested class generation
+                return CInlineUnion(field_name, union_fields, is_union), i + 1
 
             i += 1
 

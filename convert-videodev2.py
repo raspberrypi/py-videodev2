@@ -42,7 +42,7 @@ import subprocess
 import tempfile
 import os
 import shutil
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Set
 from dataclasses import dataclass
 
 
@@ -100,6 +100,7 @@ class VideoDevHeaderParser:
         self.enums: List[CEnum] = []
         self.structs: List[CStruct] = []
         self.typedefs: List[CTypedef] = []
+        self.packed_structs: Set[str] = set()  # Store names of structs with __attribute__((packed))
 
         # Type mappings from C to Python ctypes
         self.type_mapping = {
@@ -639,11 +640,22 @@ class VideoDevHeaderParser:
         # Handle pointer declarations like "struct v4l2_plane *planes" or "void *base" or "struct v4l2_clip __user *next"
         pointer_match = re.match(r"(.+?)\s+\*(\w+)", line)
         if pointer_match:
-            field_type = pointer_match.group(1).strip() + "*"  # Add * to type
+            field_type = pointer_match.group(1).strip()
             field_name = pointer_match.group(2)
+            print(f"DEBUG: parse_field pointer match: '{line}' -> type='{field_type}' name='{field_name}'", file=sys.stderr)
 
             # Clean up type - remove qualifiers like __user, __kernel, etc.
-            field_type = re.sub(r"\b__\w+\b", "", field_type).strip()
+            # But preserve kernel types like __u8, __u16, __s8, etc.
+            kernel_types = {"__u8", "__u16", "__u32", "__u64", "__s8", "__s16", "__s32", "__s64", "__le32", "__be32"}
+            words = field_type.split()
+            filtered_words = []
+            for word in words:
+                if word.startswith("__") and word not in kernel_types:
+                    # Skip __user, __kernel, etc. but keep kernel types
+                    continue
+                filtered_words.append(word)
+            field_type = " ".join(filtered_words).strip()
+            print(f"DEBUG: parse_field after cleanup: type='{field_type}'", file=sys.stderr)
             # Remove extra spaces
             field_type = re.sub(r"\s+", " ", field_type).strip()
 
@@ -655,7 +667,8 @@ class VideoDevHeaderParser:
                 )
                 return None
 
-            return CField(field_type, field_name)
+            # Mark this as a pointer field by adding "*" to the type
+            return CField(field_type + "*", field_name)
 
         # Handle regular field declarations like "int width"
         regular_match = re.match(r"(.+?)\s+(\w+)", line)
@@ -688,12 +701,60 @@ class VideoDevHeaderParser:
             return CTypedef(old_type, new_type)
         return None
 
+    def scan_for_packed_structs(self, content: str):
+        """Scan preprocessed content for structs with __attribute__((packed))"""
+        lines = content.split("\n")
+        i = 0
+        
+        while i < len(lines):
+            line = self.clean_line(lines[i])
+            if not line:
+                i += 1
+                continue
+                
+            # Look for struct definitions
+            struct_match = re.match(r"(struct|union)\s+(\w+)\s*{", line)
+            if struct_match:
+                struct_name = struct_match.group(2)
+                
+                # Find the end of this struct
+                brace_count = line.count("{") - line.count("}")
+                j = i + 1
+                
+                while j < len(lines) and brace_count > 0:
+                    struct_line = self.clean_line(lines[j])
+                    if struct_line:
+                        brace_count += struct_line.count("{") - struct_line.count("}")
+                        
+                        # Check if this line has the packed attribute
+                        if brace_count == 0 and "__attribute__" in struct_line and "packed" in struct_line:
+                            self.packed_structs.add(struct_name)
+                            break
+                    j += 1
+                
+                # Also check the next few lines after the struct ends
+                if struct_name not in self.packed_structs:
+                    for k in range(j, min(j + 3, len(lines))):
+                        if k < len(lines):
+                            next_line = self.clean_line(lines[k])
+                            if next_line and "__attribute__" in next_line and "packed" in next_line:
+                                self.packed_structs.add(struct_name)
+                                break
+                
+                i = j
+            else:
+                i += 1
+
     def parse_header(
         self, content: str, defines: Optional[List[str]] = None, clang: str = "clang"
     ):
         """Parse the entire header file"""
         # First preprocess with cc to remove comments
         content = self.preprocess_with_cpp(content, defines, clang)
+        
+        # Scan for packed structs first
+        self.scan_for_packed_structs(content)
+        
         lines = content.split("\n")
         i = 0
 
@@ -777,18 +838,28 @@ class VideoDevHeaderParser:
             "__parm_union",
             "__u_union",
         }
-        words = c_type.split()
-        filtered_words = []
-        for word in words:
-            # Keep basic kernel types, actual type names, and non-kernel annotations
-            if (
-                not word.startswith("__")
-                or word in basic_kernel_types
-                or word in actual_type_patterns
-                or any(pattern in word for pattern in ["_union", "_struct"])
-            ):
-                filtered_words.append(word)
-        c_type = " ".join(filtered_words).strip()
+        
+        # Handle pointer types specially - don't split on * for kernel types
+        if "*" in c_type:
+            # For pointer types, we'll handle them later in the method
+            # Just clean up any __user, __kernel qualifiers but preserve the type
+            c_type = re.sub(r"\b__user\b", "", c_type)
+            c_type = re.sub(r"\b__kernel\b", "", c_type)
+            c_type = re.sub(r"\s+", " ", c_type).strip()
+        else:
+            # For non-pointer types, use the word-based filtering
+            words = c_type.split()
+            filtered_words = []
+            for word in words:
+                # Keep basic kernel types, actual type names, and non-kernel annotations
+                if (
+                    not word.startswith("__")
+                    or word in basic_kernel_types
+                    or word in actual_type_patterns
+                    or any(pattern in word for pattern in ["_union", "_struct"])
+                ):
+                    filtered_words.append(word)
+            c_type = " ".join(filtered_words).strip()
 
         # Handle struct references like "struct v4l2_capability" -> "v4l2_capability"
         c_type = re.sub(r"\bstruct\s+(\w+)", r"\1", c_type)
@@ -814,12 +885,14 @@ class VideoDevHeaderParser:
         if "*" in c_type:
             # Extract the base type by removing * and whitespace
             base_type = c_type.replace("*", "").strip()
+            print(f"DEBUG: Pointer type '{c_type}' -> base_type '{base_type}'", file=sys.stderr)
             if not base_type or base_type == "void":
                 return "c_void_p"
             elif base_type == "char":
                 return "c_char_p"
             else:
                 converted_base = self.convert_type(base_type)
+                print(f"DEBUG: Base type '{base_type}' -> converted '{converted_base}'", file=sys.stderr)
                 return f"POINTER({converted_base})"
 
         # Handle const types
@@ -1077,6 +1150,7 @@ class VideoDevHeaderParser:
                     output.append(f"    class {nested_class_name}({union_type}):")
                     output.append("        _fields_ = [")
                     for field in inline_union.fields:
+                        print(f"DEBUG: generate_python_code inline union field '{field.name}' with type '{field.type}'", file=sys.stderr)
                         py_type = self.convert_type(field.type)
                         if field.array_size:
                             py_type = f"{py_type} * {field.array_size}"
@@ -1099,6 +1173,7 @@ class VideoDevHeaderParser:
                 output.append("    pass")
                 output.append(f"{struct.name}._fields_ = [")
                 for field in struct.fields:
+                    print(f"DEBUG: generate_python_code calling convert_type for field '{field.name}' with type '{field.type}'", file=sys.stderr)
                     py_type = self.convert_type(field.type)
                     if field.array_size:
                         py_type = f"{py_type} * {field.array_size}"
@@ -1114,6 +1189,15 @@ class VideoDevHeaderParser:
                             py_type = f"{py_type} * {field.array_size}"
                         output.append(f"        ('{field.name}', {py_type}),")
                     output.append("    ]")
+                    
+                    # Add _anonymous_ field if this struct has anonymous unions
+                    if struct.inline_unions:
+                        anonymous_fields = []
+                        for inline_union in struct.inline_unions:
+                            if inline_union.field_name in ['u', 's']:  # Anonymous union/struct
+                                anonymous_fields.append(f"'{inline_union.field_name}'")
+                        if anonymous_fields:
+                            output.append(f"    _anonymous_ = ({', '.join(anonymous_fields)},)")
                 else:
                     output.append("    pass")
             output.append("")
@@ -1172,6 +1256,31 @@ class VideoDevHeaderParser:
 
 
         return "\n".join(output)
+    
+    def add_packed_attributes(self, python_code: str) -> str:
+        """Add _pack_ = 1 to structs that were marked as packed"""
+        if not self.packed_structs:
+            return python_code
+            
+        lines = python_code.split('\n')
+        result_lines = []
+        
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            result_lines.append(line)
+            
+            # Check if this line defines a Structure class that should be packed
+            class_match = re.match(r'class (\w+)\(Structure\):', line)
+            if class_match:
+                struct_name = class_match.group(1)
+                if struct_name in self.packed_structs:
+                    # Add _pack_ = 1 as the next line
+                    result_lines.append('    _pack_ = 1')
+            
+            i += 1
+        
+        return '\n'.join(result_lines)
 
     def test_import(self, output_file: str) -> bool:
         """Test importing the generated Python file to validate syntax"""
@@ -1299,6 +1408,11 @@ def main():
 
     # Generate Python code
     python_code = parser.generate_python_code()
+    
+    # Add packed attributes to structs that need them
+    if parser.packed_structs:
+        print(f"📝 Found {len(parser.packed_structs)} packed structs: {', '.join(sorted(parser.packed_structs))}")
+    python_code = parser.add_packed_attributes(python_code)
 
     # Create package directory structure
     print(f"📦 Creating package directory: {args.output}")

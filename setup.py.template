@@ -11,7 +11,7 @@ def read_readme():
 
 setup(
     name="videodev2",
-    version="0.0.1",
+    version="0.0.3",
     description="Python ctypes bindings for Video4Linux2 (V4L2) API",
     long_description=read_readme(),
     long_description_content_type="text/markdown",
